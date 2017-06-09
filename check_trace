@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 # check_trace plugin for nagios
-# 
+#
 # This plugins checks whether a hostname resolves to the address you expect
 # it to. It uses dig +trace to check the entire path, from the root
 # nameservers to your domain
@@ -20,11 +20,14 @@ use Getopt::Long;
 
 use lib '/usr/lib/nagios/plugins';
 use lib '/usr/lib64/nagios/plugins';
+use lib '/usr/lib/monitoring-plugins';
 use utils qw(%ERRORS $TIMEOUT &print_revision &usage);
 
 our ($progname, $progversion);
-my ($opt_h, $opt_A, $opt_V);
+my ($opt_h, $opt_A, $opt_V, $opt_t, $opt_T, $opt_p);
 my ($verbose, $host, $address, @addresses, @found_addresses, $cnames);
+# performance data
+my (%perfdata);
 
 $progname = "check_trace";
 $progversion = "1.1";
@@ -34,48 +37,66 @@ $cnames = 5;
 # Parse options
 Getopt::Long::Configure('bundling');
 GetOptions(
-    "V"   => \$opt_V,   "version"   => \$opt_V,
-    "h"   => \$opt_h,   "help"      => \$opt_h,
-    "H=s" => \$host,    "hostname"  => \$host,
-    "a=s" => \$address, "address"   => \$address,
-    "A=s" => \$opt_A,   "addresses" => \$opt_A,
-    "v"   => \$verbose, "verbose"   => \$verbose,
-    "c"   => \$cnames,  "cnames"    => \$cnames,
+    "V"   => \$opt_V,   "version"     => \$opt_V,
+    "h"   => \$opt_h,   "help"        => \$opt_h,
+    "H=s" => \$host,    "hostname"    => \$host,
+    "a=s" => \$address, "address"     => \$address,
+    "A=s" => \$opt_A,   "addresses"   => \$opt_A,
+    "t"   => \$opt_t,   "time"        => \$opt_t,
+    "T"   => \$opt_T,   "timeverbose" => \$opt_T,
+    "p"   => \$opt_p,   "perfdata"    => \$opt_p,
+    "v"   => \$verbose, "verbose"     => \$verbose,
+    "c"   => \$cnames,  "cnames"      => \$cnames,
 );
 
 if ($opt_h) { print_help(); exit $ERRORS{"OK"}; }
-if ($opt_V) { print_revision($progname, $progversion); exit $ERRORS{"OK"}; } 
+if ($opt_V) { print_revision($progname, $progversion); exit $ERRORS{"OK"}; }
 @addresses = ();
 @addresses = split(/,/, $opt_A) if(defined($opt_A));
 push(@addresses, $address);
 
 usage(_usage) unless $host;
-usage(_usage) unless $address;
+# allow -t option without address check
+usage(_usage) unless $address || $opt_t;
 
 # Trace the hostname
 my $orig_host = $host;
 $host .= '.' unless $host =~ /\.$/;
 my @ns_trace = ();
 my $cname_count = 0;
+my $resolving_step = 0;
 
 while($cname_count <= $cnames) {
     my $cname = undef;
+    my $last_finding = undef;
+    my $last_type = undef;
     print "*** Searching $host\n" if $verbose;
     open(DIG, '-|', "dig +time=$TIMEOUT +trace $host");
     while(<DIG>) {
         print if $verbose;
         # ;; Received 427 bytes from 192.33.4.12#53(C.ROOT-SERVERS.NET) in 24 ms
-        if(/^;; Received.*?\((.*?)\)./) {
-            push(@ns_trace, $1);
+        if(/^;; Received.*?\((.*?)\)\s+in\s+(\d+)\s+.*/) {
+            push(@ns_trace, {"ns" => "$1",
+                             "time" => "$2",
+                             # add final finding into last resolving_step
+                             "resolving_step" => $last_finding ? ($resolving_step-1) : $resolving_step,
+                             "last_finding" => $last_finding,
+                             "last_type" => $last_type});
         }
         # foo.example.com.  86400   IN  CNAME   bar.example.com.
         if(/$host\s+\d+\s+IN\s+CNAME\s+(.*)/) {
             $cname = sprintf('%s CNAME %s', $host, $1);
             $host = $1;
+            $last_finding = $1;
+            $last_type = 'CNAME';
+            $resolving_step++;
         }
         # bar.example.com. 300 IN  A   127.0.0.1
         if(/$host\s+\d+\s+IN\s+A\s+(.*)/) {
             push(@found_addresses, $1);
+            $last_finding = $1;
+            $last_type = 'A';
+            $resolving_step++;
         }
     }
     last if not defined($cname);
@@ -91,21 +112,85 @@ if($cname_count == $cnames) {
 }
 
 my @errors;
-foreach my $address (@addresses) {
+unless ($opt_t) {
+  foreach my $address (@addresses) {
     if(!in(\@found_addresses, $address)) {
        push(@errors,"$orig_host did not resolve to $address");
     }
-}
-foreach my $address (@found_addresses) {
+  }
+  foreach my $address (@found_addresses) {
     if(!in(\@addresses, $address)) {
         push(@errors, "$orig_host resolved to $address");
     }
+  }
 }
+# if ($opt_t) {
+#   foreach my $received (@ns_trace) {
+#     print "Trace time: $received\n"
+#   }
+# }
+
 if(@errors) {
     print join(', ', @errors);
     exit $ERRORS{"CRITICAL"};
 }
-print "$orig_host resolved to ".join(', ', @addresses)." via ".join(', ', @ns_trace);
+if ($opt_t) {
+  # output trace result
+  my $sum_time_ms = 0;
+  my $last_step = 0;
+  foreach my $received (@ns_trace) {
+    next unless (ref $received eq ref {});
+    next unless $$received{'time'};
+    # here we have valid entries in $$received
+    if ($last_step lt $$received{'resolving_step'}) {
+      # clear sum counters
+      $sum_time_ms = 0;
+      $last_step = $$received{'resolving_step'};
+    }
+
+    $sum_time_ms += $$received{'time'};
+    next unless $$received{'last_finding'} || $opt_T;
+    # prepare perfdata
+    $perfdata{"step$$received{'resolving_step'}.ns"} = $$received{'ns'};
+    $perfdata{"step$$received{'resolving_step'}.time_ms"} = $$received{'time'};
+    $perfdata{"step$$received{'resolving_step'}.total_ms"} = $sum_time_ms;
+    $perfdata{"step$$received{'resolving_step'}.last_type"} =
+      $$received{'last_type'} ? $$received{'last_type'} : "none";
+    $perfdata{"step$$received{'resolving_step'}.last_finding"} =
+      $$received{'last_finding'} ? $$received{'last_finding'} : "none";
+
+    if ($opt_p) {
+      # print perfdata message output (as short as possible)
+      printf("Step%d: %s (%sms/%dms) ",
+             $$received{'resolving_step'},
+             $$received{'last_finding'} ? $$received{'last_finding'} : "none",
+             $$received{'time'},
+             $sum_time_ms);
+    } else {
+      # provide detail output
+      printf("Trace time[%d]: %s in %sms (%dms) for finding %s: %s\n",
+              $$received{'resolving_step'},
+              $$received{'ns'},
+              $$received{'time'},
+              $sum_time_ms,
+              $$received{'last_type'} ? $$received{'last_type'} : "none",
+              $$received{'last_finding'} ? $$received{'last_finding'} : "none");
+    }
+  }
+  if ($opt_p) {
+    # print perfdata
+    printf " | "; # start perfdata output
+    foreach my $key (keys %perfdata) {
+      # print perfdata string out
+      printf "$key=$perfdata{$key} ";
+    }
+    # close perfdata with line break
+    printf "\n";
+  }
+} else {
+  # output standard result string
+  print "$orig_host resolved to ".join(', ', @addresses)." via ".join(', ', @ns_trace);
+}
 exit $ERRORS{"OK"};
 
 sub print_help() {
@@ -115,6 +200,9 @@ sub print_help() {
     "\n" .
     "-H|--hostname hostname to resolve\n" .
     "-a|--address address it resolves to\n" .
+    "-t|--time print time for each step\n" .
+    "-T|--timeverbose print time for every response\n" .
+    "-p|--perfdata print details only in perfdata\n" .
     "-A|--addresses extra addresses it can resolve to (round robin)\n" .
     "-c|--cnames max. number of CNAME's to follow\n" .
     "\n" .
@@ -123,7 +211,7 @@ sub print_help() {
 }
 
 sub _usage() {
-    return "Usage:\n$progname -H hostname -a address [-A extra_addresses] -v\n" .
+    return "Usage:\n$progname -H hostname -a address [-A extra_addresses] -tTpv\n" .
            "$progname -h|--help\n" .
            "$progname -V|--version\n"
 }
